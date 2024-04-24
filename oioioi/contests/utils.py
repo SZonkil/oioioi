@@ -8,7 +8,8 @@ from django.utils.module_loading import import_string
 from pytz import UTC
 
 from oioioi.base.permissions import make_request_condition
-from oioioi.base.utils import request_cached
+from oioioi.base.utils import request_cached, request_cached_complex
+from oioioi.base.utils.public_message import get_public_message
 from oioioi.base.utils.query_helpers import Q_always_false
 from oioioi.contests.models import (
     Contest,
@@ -16,6 +17,9 @@ from oioioi.contests.models import (
     Round,
     RoundTimeExtension,
     Submission,
+    FilesMessage,
+    SubmissionsMessage,
+    SubmitMessage,
 )
 
 
@@ -225,22 +229,26 @@ def submittable_problem_instances(request):
     return [pi for pi in queryset if controller.can_submit(request, pi)]
 
 
-@request_cached
-def visible_problem_instances(request):
+@request_cached_complex
+def visible_problem_instances(request, no_admin=False):
     controller = request.contest.controller
     queryset = (
         ProblemInstance.objects.filter(contest=request.contest)
         .select_related('problem')
         .prefetch_related('round')
     )
-    return [pi for pi in queryset if controller.can_see_problem(request, pi)]
+    return [pi for pi in queryset if controller.can_see_problem(
+        request, pi, no_admin=no_admin,
+    )]
 
 
-@request_cached
-def visible_rounds(request):
+@request_cached_complex
+def visible_rounds(request, no_admin=False):
     controller = request.contest.controller
     queryset = Round.objects.filter(contest=request.contest)
-    return [r for r in queryset if controller.can_see_round(request, r)]
+    return [r for r in queryset if controller.can_see_round(
+        request, r, no_admin=no_admin,
+    )]
 
 
 def aggregate_statuses(statuses):
@@ -408,17 +416,13 @@ def best_round_to_display(request, allow_past_rounds=False):
             (round, contest.controller.get_round_times(request, round))
             for round in Round.objects.filter(contest=contest)
         )
-        next_rtimes = [
-            (r, rt) for r, rt in rtimes.items() if rt.is_future(timestamp)
-        ]
+        next_rtimes = [(r, rt) for r, rt in rtimes.items() if rt.is_future(timestamp)]
         next_rtimes.sort(key=lambda r_rt: r_rt[1].get_start())
         current_rtimes = [
             (r, rt) for r, rt in rtimes if rt.is_active(timestamp) and rt.get_end()
         ]
         current_rtimes.sort(key=lambda r_rt1: r_rt1[1].get_end())
-        past_rtimes = [
-            (r, rt) for r, rt in rtimes.items() if rt.is_past(timestamp)
-        ]
+        past_rtimes = [(r, rt) for r, rt in rtimes.items() if rt.is_past(timestamp)]
         past_rtimes.sort(key=lambda r_rt2: r_rt2[1].get_end())
 
     if current_rtimes:
@@ -435,3 +439,66 @@ def best_round_to_display(request, allow_past_rounds=False):
 def has_any_contest(request):
     contests = [contest for contest in administered_contests(request)]
     return len(contests) > 0
+
+
+def get_files_message(request):
+    return get_public_message(
+        request,
+        FilesMessage,
+        'files_message',
+    )
+
+
+def get_submissions_message(request):
+    return get_public_message(
+        request,
+        SubmissionsMessage,
+        'submissions_message',
+    )
+
+
+def get_submit_message(request):
+    return get_public_message(
+        request,
+        SubmitMessage,
+        'submit_message',
+    )
+
+
+@make_request_condition
+@request_cached
+def is_contest_archived(request):
+    return (
+        hasattr(request, 'contest')
+        and request.contest.is_archived
+    )
+
+
+def get_inline_for_contest(inline, contest):
+    """Returns inline without add, change or delete permissions,
+    with all fields in readonly for archived contests.
+    For unarchived contests returns the inline itself.
+    """
+    if not contest or not contest.is_archived:
+        return inline
+
+    class ArchivedInlineWrapper(inline):
+        extra = 0
+        max_num = 0
+        can_delete = False
+        editable_fields = []
+        exclude = []
+
+        def has_add_permission(self, request, obj=None):
+            return False
+
+        def has_change_permission(self, request, obj=None):
+            return False
+
+        def has_delete_permission(self, request, obj=None):
+            return False
+
+        def has_view_permission(self, request, obj=None):
+            return True
+
+    return ArchivedInlineWrapper

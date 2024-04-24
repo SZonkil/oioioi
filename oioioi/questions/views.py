@@ -1,5 +1,5 @@
 import calendar
-import datetime
+from datetime import datetime, timezone
 
 from django.conf import settings
 from django.contrib import messages as django_messages
@@ -21,6 +21,7 @@ from oioioi.base.utils.user_selection import get_user_hints_view
 from oioioi.contests.utils import (
     can_enter_contest,
     contest_exists,
+    is_contest_archived,
     is_contest_basicadmin,
     visible_rounds,
 )
@@ -29,15 +30,23 @@ from oioioi.questions.forms import (
     AddReplyForm,
     FilterMessageAdminForm,
     FilterMessageForm,
+    NewsMessageForm,
+    AddQuestionMessageForm,
 )
 from oioioi.questions.mails import new_question_signal
 from oioioi.questions.models import (
     Message,
     MessageView,
     QuestionSubscription,
-    ReplyTemplate,
+    ReplyTemplate
 )
-from oioioi.questions.utils import get_categories, log_addition, unanswered_questions
+from oioioi.questions.utils import (
+    get_categories,
+    log_addition,
+    unanswered_questions,
+    get_add_question_message,
+    get_news_message,
+)
 
 
 def visible_messages(request, author=None, category=None, kind=None):
@@ -200,6 +209,8 @@ def messages_view(request):
             'already_subscribed': already_subscribed,
             'no_email': no_email,
             'onsite': request.contest.controller.is_onsite(),
+            'message': get_news_message(request),
+            'is_contest_archived': is_contest_archived(request),
             **template_kwargs,
         },
     )
@@ -328,6 +339,7 @@ def message_view(request, message_id):
         is_contest_basicadmin(request)
         and message.kind == 'QUESTION'
         and message.can_have_replies
+        and not is_contest_archived(request)
     ):
         if request.method == 'POST':
             form = AddReplyForm(request, request.POST)
@@ -367,7 +379,7 @@ def message_view(request, message_id):
     )
 
 
-@enforce_condition(not_anonymous & contest_exists & can_enter_contest)
+@enforce_condition(not_anonymous & contest_exists & can_enter_contest & ~is_contest_archived)
 def add_contest_message_view(request):
     is_admin = is_contest_basicadmin(request)
     if request.method == 'POST':
@@ -404,7 +416,12 @@ def add_contest_message_view(request):
     return TemplateResponse(
         request,
         'questions/add.html',
-        {'form': form, 'title': title, 'is_news': is_admin},
+        {
+            'form': form,
+            'title': title,
+            'is_news': is_admin,
+            'message': get_add_question_message(request),
+        },
     )
 
 
@@ -444,8 +461,9 @@ def increment_template_usage_view(request, template_id=None):
 @jsonify
 @enforce_condition(contest_exists)
 def check_new_messages_view(request, topic_id):
-    timestamp = request.GET['timestamp']
-    unix_date = datetime.datetime.fromtimestamp(int(timestamp))
+    timestamp = int(request.GET['timestamp'])
+    # utcfromtimestamp returns a naive datetime
+    date = datetime.utcfromtimestamp(timestamp).replace(tzinfo=timezone.utc)
     output = [
         [
             x.topic,
@@ -454,7 +472,7 @@ def check_new_messages_view(request, topic_id):
         ]
         for x in visible_messages(request)
         .filter(top_reference_id=topic_id)
-        .filter(date__gte=unix_date)
+        .filter(date__gte=date)
     ]
     return {'timestamp': request_time_seconds(request), 'messages': output}
 
@@ -485,3 +503,37 @@ def subscription(request):
     else:
         # request.method == 'GET', enforced by decorator
         return HttpResponse(subscribed)
+
+
+@enforce_condition(contest_exists & is_contest_basicadmin)
+def news_edit_view(request):
+    instance = get_news_message(request)
+    if request.method == 'POST':
+        form = NewsMessageForm(request, request.POST, instance=instance)
+        if form.is_valid():
+            form.save()
+            return redirect('contest_messages', contest_id=request.contest.id)
+    else:
+        form = NewsMessageForm(request, instance=instance)
+    return TemplateResponse(
+        request,
+        'public_message/edit.html',
+        {'form': form, 'title': _("Edit news message")},
+    )
+
+
+@enforce_condition(contest_exists & is_contest_basicadmin)
+def add_edit_message_view(request):
+    instance = get_add_question_message(request)
+    if request.method == 'POST':
+        form = AddQuestionMessageForm(request, request.POST, instance=instance)
+        if form.is_valid():
+            form.save()
+            return redirect('contest_messages', contest_id=request.contest.id)
+    else:
+        form = AddQuestionMessageForm(request, instance=instance)
+    return TemplateResponse(
+        request,
+        'public_message/edit.html',
+        {'form': form, 'title': _("Edit add question message")},
+    )

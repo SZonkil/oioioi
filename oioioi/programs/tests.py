@@ -1,11 +1,12 @@
 import os
 import re
 from collections import defaultdict
-from datetime import datetime, timezone  # pylint: disable=E0611
+from datetime import datetime, timezone, timedelta  # pylint: disable=E0611
 
 import pytest
 import six
 import urllib
+import yaml
 
 from django.conf import settings
 from django.contrib.admin.utils import quote
@@ -17,6 +18,7 @@ from django.test.utils import override_settings
 from django.urls import reverse
 from django.utils.html import escape, strip_tags
 from django.utils.http import urlencode
+from django.utils import timezone as django_timezone
 from oioioi.base.notification import NotificationHandler
 from oioioi.base.tests import (
     TestCase,
@@ -28,13 +30,13 @@ from oioioi.base.utils import memoized_property
 from oioioi.base.utils.test_migrations import TestCaseMigrations
 from oioioi.contests.models import Contest, ProblemInstance, Round, Submission
 from oioioi.contests.scores import IntegerScore
-from oioioi.contests.handlers import call_submission_judged
+from oioioi.contests.handlers import send_notification_judged
 from oioioi.contests.tests import PrivateRegistrationController, SubmitMixin
 from oioioi.filetracker.tests import TestStreamingMixin
 from oioioi.problems.models import Problem
 from oioioi.programs import utils
 from oioioi.programs.controllers import ProgrammingContestController
-from oioioi.programs.handlers import make_report, collect_tests
+from oioioi.programs.handlers import collect_tests
 from oioioi.programs.models import (
     ModelSolution,
     ProblemAllowedLanguage,
@@ -48,6 +50,7 @@ from oioioi.programs.models import (
 from oioioi.programs.problem_instance_utils import get_allowed_languages_dict
 from oioioi.programs.utils import form_field_id_for_langs
 from oioioi.programs.views import _testreports_to_generate_outs
+from oioioi.sinolpack.models import ExtraConfig
 from oioioi.sinolpack.tests import get_test_filename
 from oioioi.evalmgr.tasks import create_environ
 
@@ -518,6 +521,7 @@ class TestSubmission(TestCase, SubmitFileMixin):
     def setUp(self):
         self.assertTrue(self.client.login(username='test_user'))
 
+    @override_settings(TIME_ZONE="Europe/Warsaw")
     def test_submission_completed_notification(self):
         msg_count = defaultdict(int)
         messages = []
@@ -546,20 +550,35 @@ class TestSubmission(TestCase, SubmitFileMixin):
         environ['is_rejudge'] = False
         environ['submission_id'] = submission.pk
         environ['contest_id'] = submission.problem_instance.contest.id
-        call_submission_judged(environ)
-
-        environ['is_rejudge'] = True
-        call_submission_judged(environ)
+        send_notification_judged(environ)
 
         # Check if a notification for user 1001 was send
         # And user 1002 doesn't received a notification
+        self.assertEqual(len(messages), 1)
         self.assertEqual(msg_count['user_1001_notifications'], 1)
         self.assertEqual(msg_count['user_1002_notifications'], 0)
 
+        environ['is_rejudge'] = True
+        send_notification_judged(environ)
         self.assertEqual(len(messages), 1)
+
+        environ['is_rejudge'] = False
+        # Results barely not available, should catch timezone-related errors
+        Round.objects.update(
+            results_date=django_timezone.now()+timedelta(minutes=30)
+        )
+        send_notification_judged(environ)
+        self.assertEqual(len(messages), 1)
+
+        Round.objects.update(results_date=None)
+        send_notification_judged(environ)
+        self.assertEqual(len(messages), 1)
+
         self.assertIn('%(score)s', messages[0][0])
         self.assertIn('score', messages[0][1])
         self.assertEqual(messages[0][1]['score'], '34')
+        self.assertIn('was judged', messages[0][0])
+        self.assertNotIn('Initial result', messages[0][0])
 
         NotificationHandler.send_notification = send_notification_backup
 
@@ -620,12 +639,25 @@ class TestSubmission(TestCase, SubmitFileMixin):
             self.assertEqual(200, response.status_code)
             self.assertContains(response, 'Sorry, there are no problems')
 
+    def _set_code_size_limit(self, limit):
+        ec = ExtraConfig.objects.get()
+        conf = ec.parsed_config
+        conf['submission_size_limit'] = limit
+        ec.config = yaml.dump(conf)
+        ec.save()
+
     def test_huge_submission(self):
         contest = Contest.objects.get()
         problem_instance = ProblemInstance.objects.get(pk=1)
         response = self.submit_file(contest, problem_instance, file_size=102405)
         self.assertContains(response, 'File size limit exceeded.')
         self.assertNotContains(response, 'You have to either choose file or paste')
+        self._set_code_size_limit(102404)
+        response = self.submit_file(contest, problem_instance, file_size=102405)
+        self.assertContains(response, 'File size limit exceeded.')
+        self._set_code_size_limit(102405)
+        response = self.submit_file(contest, problem_instance, file_size=102405)
+        self.assertEqual(response.status_code, 302);
 
     def test_huge_code_length(self):
         contest = Contest.objects.get()
@@ -633,6 +665,12 @@ class TestSubmission(TestCase, SubmitFileMixin):
         code = 'a' * 102401
         response = self.submit_code(contest, problem_instance, code=code)
         self.assertContains(response, 'Code length limit exceeded.')
+        self._set_code_size_limit(102400)
+        response = self.submit_code(contest, problem_instance, code=code)
+        self.assertContains(response, 'Code length limit exceeded.')
+        self._set_code_size_limit(102401)
+        response = self.submit_code(contest, problem_instance, code=code)
+        self.assertEqual(response.status_code, 302);
 
     def test_size_limit_accuracy(self):
         contest = Contest.objects.get()
@@ -899,6 +937,7 @@ class TestNotifications(TestCase):
 
     def test_initial_results_notification(self):
         msg_count = defaultdict(int)
+        messages = []
 
         @classmethod
         def fake_send_notification(
@@ -910,25 +949,38 @@ class TestNotifications(TestCase):
         ):
             if user.pk == 1001 and notification_type == 'initial_results':
                 msg_count['user_1001_notifications'] += 1
+            messages.append((notification_message, notificaion_message_arguments))
 
         send_notification_backup = NotificationHandler.send_notification
         NotificationHandler.send_notification = fake_send_notification
-        make_report(
-            {
-                'compilation_result': 'OK',
-                'submission_id': 1,
-                'status': 'OK',
-                'score': None,
-                'max_score': None,
-                'compilation_message': '',
-                'tests': {},
-                'rejudge': False,
-            },
-            'INITIAL',
-        )
+        environ = {
+            'compilation_result': 'OK',
+            'submission_id': 1,
+            'status': 'OK',
+            'score': None,
+            'max_score': None,
+            'compilation_message': '',
+            'tests': {},
+            'is_rejudge': False,
+        }
 
+        send_notification_judged(environ, 'INITIAL')
         # Check if a notification for user 1001 was sent
         self.assertEqual(msg_count['user_1001_notifications'], 1)
+
+        environ['status'] = 'CE'
+        send_notification_judged(environ, 'INITIAL')
+        # We should send a notif even for non-compiling submissions
+        self.assertEqual(msg_count['user_1001_notifications'], 2)
+
+        environ['is_rejudge'] = True
+        send_notification_judged(environ, 'INITIAL')
+        # No notification should be sent for a rejudge
+        self.assertEqual(msg_count['user_1001_notifications'], 2)
+
+        self.assertIn('Initial result', messages[0][0])
+        self.assertNotIn('was judged', messages[0][0])
+
         NotificationHandler.send_notification = send_notification_backup
 
 

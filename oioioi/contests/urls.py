@@ -1,3 +1,4 @@
+import sys
 from importlib import import_module
 
 from django.conf import settings
@@ -113,8 +114,23 @@ c_patterns = [
         views.submit_view,
         name='submit',
     ),
+    re_path(
+        r'^submit_edit_message/$',
+        views.edit_submit_message_view,
+        name='edit_submit_message',
+    ),
     re_path(r'^submissions/$', views.my_submissions_view, name='my_submissions'),
+    re_path(
+        r'^submissions_edit_message/$',
+        views.edit_submissions_message_view,
+        name='edit_submissions_message',
+    ),
     re_path(r'^files/$', views.contest_files_view, name='contest_files'),
+    re_path(
+        r'^files_edit_message/$',
+        views.edit_files_message_view,
+        name='edit_files_message',
+    ),
     re_path(
         r'^ca/(?P<attachment_id>\d+)/$',
         views.contest_attachment_view,
@@ -133,6 +149,8 @@ c_patterns = [
         name='user_info_redirect',
     ),
     re_path(r'^admin/', admin.contest_site.urls),
+    re_path(r'^archive/confirm$', views.confirm_archive_contest, name='confirm_archive_contest'),
+    re_path(r'^unarchive/$', views.unarchive_contest, name='unarchive_contest'),
 ]
 
 nonc_patterns = [
@@ -204,8 +222,11 @@ for app in settings.INSTALLED_APPS:
             # patterns defined in the global urls.py are an exception
             if hasattr(urls_module, 'urlpatterns'):
                 neutral_patterns += getattr(urls_module, 'urlpatterns')
-        except ImportError:
+        except ModuleNotFoundError:
             pass
+        except ImportError as e:
+            if settings.DEBUG:
+                print(e, file=sys.stderr)
 
 # We actually use make_patterns here, but we don't pass the globs, because
 # the algorithm in oioioi.urls has yet to capture all urls, including ours.

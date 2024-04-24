@@ -8,10 +8,21 @@ from django.urls import reverse
 from django.utils import timezone
 
 from oioioi.base.tests import TestCase, fake_time
+from oioioi.base.tests.tests import TestPublicMessage
 from oioioi.contests.models import Contest
 from oioioi.forum.forms import PostForm
-from oioioi.forum.models import Ban, Category, Post, PostReaction, Thread
+from oioioi.forum.models import (
+    Ban,
+    Category,
+    Post,
+    PostReaction,
+    Thread,
+    ForumMessage,
+    NewPostMessage,
+    Forum,
+)
 from oioioi.participants.models import Participant
+from oioioi.programs.controllers import ProgrammingContestController
 
 
 def get_contest_with_forum():
@@ -900,3 +911,97 @@ class TestBan(TestCase):
         self.assertEqual('Abuse', ban.reason)
         self.assertEqual(self.contest.forum, ban.forum)
         self.assertEqual([False, False, False, True], check_reports())
+
+
+class PublicMessagesContestController(ProgrammingContestController):
+    forum_message = 'Test public message'
+    forum_new_post_message = 'Test public message'
+
+
+class TestForumMessage(TestPublicMessage):
+    model = ForumMessage
+    button_viewname = 'forum'
+    edit_viewname = 'edit_forum_message'
+    viewname = 'forum'
+    controller_name = 'oioioi.forum.tests.PublicMessagesContestController'
+
+    def setUp(self):
+        super().setUp()
+        contest = Contest.objects.get()
+        Forum.objects.get_or_create(contest=contest)
+
+
+class TestNewPostMessage(TestPublicMessage):
+    model = NewPostMessage
+    button_viewname = 'forum'
+    edit_viewname = 'edit_forum_new_post_message'
+    viewname = 'forum_thread'
+    controller_name = 'oioioi.forum.tests.PublicMessagesContestController'
+
+    def setUp(self):
+        super().setUp()
+        contest = Contest.objects.get()
+        forum = Forum.objects.get_or_create(contest=contest)[0]
+        cat = Category.objects.get_or_create(forum=forum, name='test_category')[0]
+        thr = Thread.objects.get_or_create(category=cat, name='test_thread')[0]
+        self.viewname_kwargs = {
+            'contest_id': contest.id,
+            'category_id': cat.id,
+            'thread_id': thr.id,
+        }
+
+
+class TestContestArchived(TestCase):
+    fixtures = ['test_users', 'test_archived_contest']
+
+    def setUp(self):
+        self.contest = get_contest_with_forum()
+        self.user = User.objects.get(username='test_user')
+        self.category = Category(forum=self.contest.forum, name='test_category')
+        self.category.save()
+
+    def test_add_new_forum_category(self):
+        self.assertTrue(self.client.login(username='test_user'))
+        self.client.get('/c/c/')  # 'c' becomes the current contest
+
+        url = reverse('oioioiadmin:forum_category_add', kwargs={'contest_id': 'c'})
+        # non-admins should not be able to add categories when contest is archived
+        response = self.client.get(url, follow=True)
+        self.assertEqual(403, response.status_code)
+
+        self.client.logout()
+        self.assertTrue(self.client.login(username='test_admin'))
+        self.client.get('/c/c/')  # 'c' becomes the current contest
+
+        # admins also should not be able to add categories when contest is archived
+        response = self.client.get(url, follow=True)
+        self.assertEqual(403, response.status_code)
+
+    def test_add_post(self):
+        thr = Thread(category=self.category, name='test_thread')
+        thr.save()
+        thread_url = reverse(
+            'forum_thread',
+            kwargs={
+                'contest_id': self.contest.id,
+                'category_id': self.category.id,
+                'thread_id': thr.id,
+            },
+        )
+        # non-admins should not be able to post when contest is archived
+        self.assertTrue(self.client.login(username='test_user'))
+        self.assertFalse(Post.objects.filter(author=self.user).exists())
+        response = self.client.get(thread_url)
+        self.assertNotIsInstance(response.context['form'], PostForm)
+
+        self.client.post(thread_url, {'content': "lorem ipsum?"})
+        self.assertFalse(Post.objects.filter(author=self.user).exists())
+        self.client.logout()
+
+        # admins also should not be able to post when contest is archived
+        self.assertTrue(self.client.login(username='test_admin'))
+        response = self.client.get(thread_url)
+        self.assertNotIsInstance(response.context['form'], PostForm)
+
+        self.client.post(thread_url, {'content': "lorem ipsum?"})
+        self.assertFalse(Post.objects.filter(author=self.user).exists())
