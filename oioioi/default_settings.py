@@ -659,7 +659,7 @@ LOGGING = {
 # Celery configuration
 
 CELERY_QUEUES = {}
-CELERY_RESULT_BACKEND = 'amqp'
+CELERY_RESULT_BACKEND = 'rpc'
 CELERY_ACKS_LATE = True
 CELERY_SEND_EVENTS = True
 
@@ -715,6 +715,7 @@ PRINTING_COMMAND = ['lp', '-o landscape', '-o sides=two-sided-short-edge']
 # To get unlimited submissions count set to 0.
 DEFAULT_SUBMISSIONS_LIMIT = 10
 WARN_ABOUT_REPEATED_SUBMISSION = True
+DEFAULT_SUBMISSION_SIZE_LIMIT = 1024 * 100  # in bytes
 
 # Only used if 'testrun' app is enabled.
 # To get unlimited test runs set to 0.
@@ -861,6 +862,8 @@ HIDE_USERCONTESTS = False
 
 FORUM_PAGE_SIZE = 15
 FORUM_THREADS_PER_PAGE = 30
+FORUM_POSTS_PER_PAGE = 30
+FORUM_POST_MAX_LENGTH = 20000
 
 # Check seems to be broken. https://stackoverflow.com/a/65578574
 SILENCED_SYSTEM_CHECKS = ['admin.E130']

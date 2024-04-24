@@ -511,7 +511,7 @@ class ContestController(RegisteredSubclassesBase, ObjectWithMixins):
 
         return sorted(queryset, key=sort_key)
 
-    def can_see_round(self, request_or_context, round):
+    def can_see_round(self, request_or_context, round, no_admin=False):
         """Determines if the current user is allowed to see the given round.
 
         If not, everything connected with this round will be hidden.
@@ -519,7 +519,7 @@ class ContestController(RegisteredSubclassesBase, ObjectWithMixins):
         The default implementation checks if the round is not in the future.
         """
         context = self.make_context(request_or_context)
-        if context.is_admin:
+        if not no_admin and context.is_admin:
             return True
         rtimes = self.get_round_times(request_or_context, round)
         return not rtimes.is_future(context.timestamp)
@@ -550,7 +550,7 @@ class ContestController(RegisteredSubclassesBase, ObjectWithMixins):
     def default_can_see_ranking(self, request_or_context):
         return True
 
-    def can_see_problem(self, request_or_context, problem_instance):
+    def can_see_problem(self, request_or_context, problem_instance, no_admin=False):
         """Determines if the current user is allowed to see the given problem.
 
         If not, the problem will be hidden from all lists, so that its name
@@ -562,9 +562,11 @@ class ContestController(RegisteredSubclassesBase, ObjectWithMixins):
         context = self.make_context(request_or_context)
         if not problem_instance.round:
             return False
-        if context.is_admin:
+        if not no_admin and context.is_admin:
             return True
-        return self.can_see_round(request_or_context, problem_instance.round)
+        return self.can_see_round(
+            request_or_context, problem_instance.round, no_admin=no_admin
+        )
 
     def can_see_statement(self, request_or_context, problem_instance):
         """Determines if the current user is allowed to see the statement for
@@ -963,6 +965,9 @@ class ContestController(RegisteredSubclassesBase, ObjectWithMixins):
         )
         email.send()
 
+    def get_complaints_email(self, request):
+        return settings.COMPLAINTS_EMAIL
+
     def _is_partial_score(self, test_report):
         if not test_report:
             return False
@@ -984,7 +989,7 @@ class PastRoundsHiddenContestControllerMixin(object):
     Do not use it with overlapping rounds.
     """
 
-    def can_see_round(self, request_or_context, round):
+    def can_see_round(self, request_or_context, round, no_admin=False):
         """Decides whether the given round should be shown for the given user.
         The algorithm is as follows:
 
@@ -1003,7 +1008,7 @@ class PastRoundsHiddenContestControllerMixin(object):
              1. Otherwise the decision is made by the superclass method.
         """
         context = self.make_context(request_or_context)
-        if context.is_admin:
+        if not no_admin and context.is_admin:
             return True
 
         rtimes = self.get_round_times(None, round)
@@ -1019,7 +1024,7 @@ class PastRoundsHiddenContestControllerMixin(object):
                 return False
 
         return super(PastRoundsHiddenContestControllerMixin, self).can_see_round(
-            request_or_context, round
+            request_or_context, round, no_admin
         )
 
 

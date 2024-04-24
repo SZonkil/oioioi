@@ -1,6 +1,7 @@
 # pylint: disable=abstract-method
 from __future__ import print_function
 
+import os
 import re
 from datetime import datetime, timedelta, timezone  # pylint: disable=E0611
 from functools import partial
@@ -14,12 +15,14 @@ from django.contrib.auth.models import AnonymousUser, User
 from django.core import mail
 from django.core.exceptions import ValidationError
 from django.core.files.base import ContentFile
+from django.core.management import call_command
 from django.http import HttpResponse
 from django.template import RequestContext, Template
 from django.test import RequestFactory
 from django.test.utils import override_settings
 from django.urls import NoReverseMatch, reverse
 from oioioi.base.tests import TestCase, TestsUtilsMixin, check_not_accessible, fake_time
+from oioioi.base.tests.tests import TestPublicMessage
 from oioioi.contests.current_contest import ContestMode
 from oioioi.contests.date_registration import date_registry
 from oioioi.contests.models import (
@@ -37,6 +40,9 @@ from oioioi.contests.models import (
     Submission,
     UserResultForContest,
     UserResultForProblem,
+    FilesMessage,
+    SubmissionsMessage,
+    SubmitMessage,
 )
 from oioioi.contests.scores import IntegerScore, ScoreValue
 from oioioi.contests.tests import make_empty_contest_formset
@@ -246,7 +252,9 @@ class TestSubmissionListOrder(TestCase):
         self.assertTrue(test_first_index < test_second_index, error_msg)
 
 
+
 # TODO: expand this TestCase
+@override_settings(CONTEST_MODE=ContestMode.neutral)
 class TestSubmissionListFilters(TestCase):
     fixtures = [
         'test_users',
@@ -261,20 +269,55 @@ class TestSubmissionListFilters(TestCase):
     def setUp(self):
         self.assertTrue(self.client.login(username='test_admin'))
         self.url = reverse(
-            'oioioiadmin:contests_submission_changelist', kwargs={'contest_id': 'c'}
+            'noncontest:oioioiadmin:contests_submission_changelist',
+        )
+        self.curl = reverse(
+            'oioioiadmin:contests_submission_changelist',
+            kwargs={'contest_id': 'c'},
         )
         super().setUp()
 
+    def get_package(self, name):
+        return os.path.join(os.path.dirname(__file__), '../../sinolpack/files', name)
+
     def test_all_filters(self):
-        response = self.client.get(self.url, {
+        args = {
             'has_active_system_error': 'yes',
             'kind': 'NORMAL',
             'status__exact': 'INI_OK',
             'revealed': '1',
-            'round': 'Round 1',
             'lang': 'Pascal',
-        })
+        }
+        response = self.client.get(self.url)
         self.assertEqual(response.status_code, 200)
+        self.assertContains(response, '4 submissions')
+        response = self.client.get(self.url, args)
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, '0 submissions')
+        args['round'] = 'Round 1'
+        response = self.client.get(self.curl, args)
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, '0 submissions')
+
+    def test_search(self):
+        self.url = reverse(
+            'noncontest:oioioiadmin:contests_submission_changelist',
+        )
+        filename = self.get_package('test_simple_package_translations.zip')
+        call_command('addproblem', filename)
+        response = self.client.get(self.url)
+        self.assertContains(response, '5 submissions')
+        response = self.client.get(self.url, {'pi': 'Sumżyce'})
+        self.assertContains(response, '4 submissions')
+        response = self.client.get(self.url, {'pi': 'Sumżyce', 'q': 'Sumżyce'})
+        self.assertContains(response, '4 submissions')
+        response = self.client.get(self.url, {'pi': 'Sumżyce', 'q': 'Zadanie'})
+        self.assertContains(response, '0 submissions')
+        response = self.client.get(self.url, {'pi': 'Zadanie z tłumaczeniami'})
+        self.assertContains(response, '1 submission')
+        response = self.client.get(self.url, {'pi': 'Zadanie z tłumaczeniami', 'q': 'Zadanie'})
+        self.assertContains(response, '1 submission')
+        response = self.client.get(self.url, {'pi': 'Zadanie z tłumaczeniami', 'q': 'Sumżyce'})
         self.assertContains(response, '0 submissions')
 
 
@@ -1244,6 +1287,7 @@ class TestContestAdmin(TestCase):
                 'results_date_0': '2012-02-05',
                 'results_date_1': '06:07:08',
                 'controller_name': 'oioioi.programs.controllers.ProgrammingContestController',
+                'is_archived': 'False',
             }
         )
 
@@ -1398,169 +1442,154 @@ class TestAttachments(TestCase, TestStreamingMixin):
     ]
 
     def test_attachments(self):
-        contest = Contest.objects.get()
-        problem = Problem.objects.get()
-        ca = ContestAttachment(
-            contest=contest,
-            description='contest-attachment',
-            content=ContentFile(b'content-of-conatt', name='conatt.txt'),
-        )
-        ca.save()
-        pa = ProblemAttachment(
-            problem=problem,
-            description='problem-attachment',
-            content=ContentFile(b'content-of-probatt', name='probatt.txt'),
-        )
-        pa.save()
-        round = Round.objects.get(pk=1)
-        ra = ContestAttachment(
-            contest=contest,
-            description='round-attachment',
-            content=ContentFile(b'content-of-roundatt', name='roundatt.txt'),
-            round=round,
-        )
-        ra.save()
+        # Possible attachments:
+        #  - ContestAttachent without round: pub_date == None or not
+        #  - ProblemAttachment (has round and no pub_date)
+        #  - ContestAttachent with round: pub_date == None or before or after
 
-        self.assertTrue(self.client.login(username='test_user'))
-        response = self.client.get(
-            reverse('contest_files', kwargs={'contest_id': contest.id})
-        )
-        self.assertEqual(response.status_code, 200)
-        for part in [
-            'contest-attachment',
+        # The round starts at 2011.07.31-20:57:58
+        def get_time(hour):
+            return datetime(2011, 7, 31, hour, 0, 0, tzinfo=timezone.utc)
+
+        # The attachemnts are in (attachment, content, name) tuples.
+        contest = Contest.objects.get()
+        ca = (
+            ContestAttachment.objects.create(
+                contest=contest,
+                description='contest-attachment-simple',
+                content=ContentFile(b'content-of-conatt-simple', name='conatt.txt'),
+            ),
+            b'content-of-conatt-simple',
             'conatt.txt',
-            'problem-attachment',
+        )
+        cb = (
+            ContestAttachment.objects.create(
+                contest=contest,
+                description='contest-attachment-pub-date',
+                content=ContentFile(b'content-of-conatt-pub', name='conatt-pub.txt'),
+                pub_date=get_time(19),
+            ),
+            b'content-of-conatt-pub',
+            'conatt-pub.txt',
+        )
+        problem = Problem.objects.get()
+        pa = (
+            ProblemAttachment.objects.create(
+                problem=problem,
+                description='problem-attachment',
+                content=ContentFile(b'content-of-probatt', name='probatt.txt'),
+            ),
+            b'content-of-probatt',
             'probatt.txt',
-            'round-attachment',
+        )
+        round = Round.objects.get(pk=1)
+        ra = (
+            ContestAttachment.objects.create(
+                contest=contest,
+                description='round-attachment',
+                content=ContentFile(b'content-of-roundatt-simple', name='roundatt.txt'),
+                round=round,
+            ),
+            b'content-of-roundatt-simple',
             'roundatt.txt',
-        ]:
-            self.assertContains(response, part)
-        response = self.client.get(
-            reverse(
-                'contest_attachment',
-                kwargs={'contest_id': contest.id, 'attachment_id': ca.id},
-            )
         )
-        self.assertStreamingEqual(response, b'content-of-conatt')
-        response = self.client.get(
-            reverse(
-                'problem_attachment',
-                kwargs={'contest_id': contest.id, 'attachment_id': pa.id},
-            )
+        ra[0].save()
+        rb = (
+            ContestAttachment.objects.create(
+                contest=contest,
+                description='round-attachment-pub-date-before',
+                content=ContentFile(b'content-of-roundatt-before', name='roundatt-before.txt'),
+                round=round,
+                pub_date=get_time(19),
+            ),
+            b'content-of-roundatt-before',
+            'roundatt-before.txt',
         )
-        self.assertStreamingEqual(response, b'content-of-probatt')
-        response = self.client.get(
-            reverse(
-                'contest_attachment',
-                kwargs={'contest_id': contest.id, 'attachment_id': ra.id},
-            )
+        rc = (
+            ContestAttachment.objects.create(
+                contest=contest,
+                description='round-attachment-pub-date-after',
+                content=ContentFile(b'content-of-roundatt-after', name='roundatt-after.txt'),
+                round=round,
+                pub_date=get_time(22),
+            ),
+            b'content-of-roundatt-after',
+            'roundatt-after.txt',
         )
-        self.assertStreamingEqual(response, b'content-of-roundatt')
 
-        with fake_time(datetime(2011, 7, 10, tzinfo=timezone.utc)):
-            response = self.client.get(
-                reverse('contest_files', kwargs={'contest_id': contest.id})
-            )
+        def get_attachment_urlpattern_name(att):
+            if type(att) is ContestAttachment:
+                return 'contest_attachment'
+            assert type(att) is ProblemAttachment
+            return 'problem_attachment'
+
+        def check(visible, invisible):
+            list_url = reverse('contest_files', kwargs={'contest_id': contest.id})
+            self.assertTrue(self.client.login(username='test_user'))
+
+            # File list
+            response = self.client.get(list_url)
             self.assertEqual(response.status_code, 200)
-            for part in ['contest-attachment', 'conatt.txt']:
-                self.assertContains(response, part)
-            for part in [
-                'problem-attachment',
-                'probatt.txt',
-                'round-attachment',
-                'roundatt.txt',
-            ]:
-                self.assertNotContains(response, part)
-            response = self.client.get(
-                reverse(
-                    'contest_attachment',
-                    kwargs={'contest_id': contest.id, 'attachment_id': ca.id},
-                )
-            )
-            self.assertStreamingEqual(response, b'content-of-conatt')
-            check_not_accessible(
-                self,
-                'problem_attachment',
-                kwargs={'contest_id': contest.id, 'attachment_id': pa.id},
-            )
-            check_not_accessible(
-                self,
-                'contest_attachment',
-                kwargs={'contest_id': contest.id, 'attachment_id': ra.id},
-            )
+            for (att, content, name) in visible:
+                self.assertContains(response, name)
+                self.assertContains(response, att.description)
+            for (att, content, name) in invisible:
+                self.assertNotContains(response, name)
+                self.assertNotContains(response, att.description)
+            for f in response.context['files']:
+                self.assertEqual(f['admin_only'], False)
 
-    def test_pub_date(self):
-        contest = Contest.objects.get()
-        ca = ContestAttachment(
-            contest=contest,
-            description='contest-attachment',
-            content=ContentFile(b'content-null', name='conatt-null-date.txt'),
-            pub_date=None,
-        )
-        ca.save()
-        cb = ContestAttachment(
-            contest=contest,
-            description='contest-attachment',
-            content=ContentFile(b'content-visible', name='conatt-visible.txt'),
-            pub_date=datetime(2011, 7, 10, 0, 0, 0, tzinfo=timezone.utc),
-        )
-        cb.save()
-        cc = ContestAttachment(
-            contest=contest,
-            description='contest-attachment',
-            content=ContentFile(b'content-hidden', name='conatt-hidden.txt'),
-            pub_date=datetime(2011, 7, 10, 1, 0, 0, tzinfo=timezone.utc),
-        )
-        cc.save()
-
-        def check_visibility(*should_be_visible):
-            response = self.client.get(
-                reverse('contest_files', kwargs={'contest_id': contest.id})
-            )
-            for name in [
-                'conatt-null-date.txt',
-                'conatt-visible.txt',
-                'conatt-hidden.txt',
-            ]:
-                if name in should_be_visible:
-                    self.assertContains(response, name)
-                else:
-                    self.assertNotContains(response, name)
-
-        def check_accessibility(should_be_accesible, should_not_be_accesible):
-            for (id, content) in should_be_accesible:
+            # Actual accessibility
+            for (att, content, name) in visible:
                 response = self.client.get(
                     reverse(
-                        'contest_attachment',
-                        kwargs={'contest_id': contest.id, 'attachment_id': id},
+                        get_attachment_urlpattern_name(att),
+                        kwargs={'contest_id': contest.id, 'attachment_id': att.id},
                     )
                 )
                 self.assertStreamingEqual(response, content)
-            for id in should_not_be_accesible:
+            for (att, content, name) in invisible:
                 check_not_accessible(
                     self,
-                    'contest_attachment',
-                    kwargs={'contest_id': contest.id, 'attachment_id': id},
+                    get_attachment_urlpattern_name(att),
+                    kwargs={'contest_id': contest.id, 'attachment_id': att.id},
                 )
 
-        with fake_time(datetime(2011, 7, 10, 0, 30, 0, tzinfo=timezone.utc)):
-            self.assertTrue(self.client.login(username='test_user'))
-            check_visibility('conatt-null-date.txt', 'conatt-visible.txt')
-            check_accessibility(
-                [(ca.id, b'content-null'), (cb.id, b'content-visible')], [cc.id]
-            )
+            # File list again, but as an admin
             self.assertTrue(self.client.login(username='test_admin'))
-            check_visibility(
-                'conatt-null-date.txt', 'conatt-visible.txt', 'conatt-hidden.txt'
-            )
-            check_accessibility(
-                [
-                    (ca.id, b'content-null'),
-                    (cb.id, b'content-visible'),
-                    (cc.id, b'content-hidden'),
-                ],
-                [],
-            )
+            response = self.client.get(list_url)
+            self.assertEqual(response.status_code, 200)
+            for (att, content, name) in visible + invisible:
+                self.assertContains(response, name)
+                self.assertContains(response, att.description)
+            invisible_names = set([f[2] for f in invisible])
+            for f in response.context['files']:
+                self.assertEqual(f['admin_only'], f['name'] in invisible_names)
+
+            # Actual accessibility as an admin
+            for (att, content, name) in visible + invisible:
+                response = self.client.get(
+                    reverse(
+                        get_attachment_urlpattern_name(att),
+                        kwargs={'contest_id': contest.id, 'attachment_id': att.id},
+                    )
+                )
+                self.assertStreamingEqual(response, content)
+
+        # Now, therefore far later than all of the dates
+        check([ca, cb, pa, ra, rb, rc], [])
+        # Before all dates
+        with fake_time(get_time(18)):
+            check([ca,], [cb, pa, ra, rb, rc])
+        # Before the round start, but after the pub_dates before it
+        with fake_time(get_time(20)):
+            check([ca, cb], [pa, ra, rb, rc])
+        # After the round start, but before the last pub_date
+        with fake_time(get_time(21)):
+            check([ca, cb, pa, ra, rb], [rc])
+        # After the last pub_date
+        with fake_time(get_time(23)):
+            check([ca, cb, pa, ra, rb, rc], [])
 
 
 class TestRoundExtension(TestCase, SubmitFileMixin):
@@ -2776,6 +2805,7 @@ class TestModifyContest(TestCase):
                 'results_date_0': '2012-02-05',
                 'results_date_1': '06:07:08',
                 'controller_name': controller_name,
+                'is_archived': 'False',
             }
         )
         response = self.client.post(url, post_data, follow=True)
@@ -3399,3 +3429,103 @@ class TestOpenRegistration(TestCase):
         available_from = now - timedelta(hours=1)
         available_to = now - timedelta(minutes=5)
         check_registration(self, 403, 'CONFIG', available_from, available_to)
+
+
+class PublicMessageContestController(ProgrammingContestController):
+    files_message = 'Test public message'
+    submissions_message = 'Test public message'
+    submit_message = 'Test public message'
+
+
+class TestFilesMessage(TestPublicMessage):
+    model = FilesMessage
+    button_viewname = 'contest_files'
+    edit_viewname = 'edit_files_message'
+    viewname = 'contest_files'
+    controller_name = 'oioioi.contests.tests.tests.PublicMessageContestController'
+
+
+class TestSubmissionsMessage(TestPublicMessage):
+    model = SubmissionsMessage
+    button_viewname = 'my_submissions'
+    edit_viewname = 'edit_submissions_message'
+    viewname = 'my_submissions'
+    controller_name = 'oioioi.contests.tests.tests.PublicMessageContestController'
+
+
+class TestSubmitMessage(TestPublicMessage):
+    fixtures = [
+        'test_users',
+        'test_contest',
+        'test_full_package',
+        'test_problem_instance',
+    ]
+    model = SubmitMessage
+    button_viewname = 'my_submissions'
+    edit_viewname = 'edit_submit_message'
+    viewname = 'submit'
+    controller_name = 'oioioi.contests.tests.tests.PublicMessageContestController'
+
+
+
+class TestContestArchived(TestCase):
+    fixtures = [
+        'test_users',
+        'test_archived_contest',
+        'test_full_package',
+        'test_problem_instance',
+        'test_submission',
+    ]
+
+    def test_contest_archived(self):
+        contest = Contest.objects.get()
+        contest.controller_name = 'oioioi.oi.controllers.OIContestController'
+        contest.save()
+        url = reverse('participants_register', kwargs={'contest_id': contest.id})
+        self.assertTrue(self.client.login(username='test_user'))
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 403)
+
+    def test_submit(self):
+        self.assertTrue(self.client.login(username='test_user'))
+        url = reverse('submit', kwargs={'contest_id': 'c'})
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 403)
+
+    def test_dashboard_view(self):
+        self.assertTrue(self.client.login(username='test_user'))
+        url = reverse('default_contest_view', kwargs={'contest_id': 'c'})
+        response = self.client.get(url, follow=True)
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "This contest is archived.")
+        self.assertNotContains(response, "Submit")
+
+    def test_submission_list_visibility(self):
+        self.assertTrue(self.client.login(username='test_user'))
+        url = reverse('my_submissions', kwargs={'contest_id': 'c'})
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Sumżyce")
+
+    def test_add_question(self):
+        self.assertTrue(self.client.login(username='test_user'))
+        url = reverse('add_contest_message', kwargs={'contest_id': 'c'})
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 403)
+
+    def test_question_list_visibility(self):
+        self.assertTrue(self.client.login(username='test_user'))
+        url = reverse('contest_all_messages', kwargs={'contest_id': 'c'})
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+
+    def test_registration(self):
+        contest = Contest.objects.get()
+        contest.controller_name = 'oioioi.oi.controllers.OIContestController'
+        contest.save()
+
+        url = reverse('participants_register', kwargs={'contest_id': contest.id})
+        self.assertTrue(self.client.login(username='test_user'))
+
+        response = self.client.get(url)
+        self.assertEqual(403, response.status_code)

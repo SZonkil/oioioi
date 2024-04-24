@@ -18,9 +18,17 @@ from oioioi.contests.utils import (
     can_admin_contest,
     can_enter_contest,
     contest_exists,
+    is_contest_archived,
     is_contest_admin,
 )
-from oioioi.forum.forms import BanForm, NewThreadForm, PostForm, ReportForm
+from oioioi.forum.forms import (
+    BanForm,
+    NewThreadForm,
+    PostForm,
+    ReportForm,
+    ForumMessageForm,
+    NewPostMessageForm,
+)
 from oioioi.forum.models import Category, Post, PostReaction, post_reaction_types
 from oioioi.forum.utils import (
     annotate_posts_with_current_user_reactions,
@@ -33,6 +41,8 @@ from oioioi.forum.utils import (
     get_msgs,
     is_proper_forum,
     move_category,
+    get_forum_message,
+    get_new_post_message,
 )
 
 
@@ -54,10 +64,14 @@ from oioioi.forum.utils import (
 @enforce_condition(forum_exists_and_visible & is_proper_forum)
 def forum_view(request):
     category_set = request.contest.forum.category_set.annotate(
-        thread_count=Count('thread'),
-        post_count=Count('thread__post'),
-        reported_count=Count('thread__post', filter=Q(thread__post__reported=True))
-    ).all()
+        thread_count=Count('thread', distinct=True),
+        post_count=Count('thread__post', distinct=True),
+        reported_count=Count(
+            'thread__post',
+            filter=Q(thread__post__reported=True),
+            distinct=True
+        )
+    ).order_by('order').all()
 
     return TemplateResponse(
         request,
@@ -68,7 +82,9 @@ def forum_view(request):
             'can_interact_with_users': can_interact_with_users(request),
             'can_interact_with_admins': can_interact_with_admins(request),
             'is_locked': request.contest.forum.is_locked(),
+            'is_contest_archived': is_contest_archived(request),
             'category_set': category_set,
+            'message': get_forum_message(request),
         },
     )
 
@@ -80,7 +96,7 @@ def latest_posts_forum_view(request):
         Post.objects.filter(
             thread__category__forum=request.contest.forum.pk,
         )
-        .prefetch_related('thread')
+        .select_related('thread')
         .order_by('-add_date')
     )
     posts = annotate_posts_with_current_user_reactions(request, posts)
@@ -117,6 +133,7 @@ def category_view(request, category_id):
             'msgs': get_msgs(request),
             'can_interact_with_users': can_interact_with_users(request),
             'can_interact_with_admins': can_interact_with_admins(request),
+            'is_contest_archived': is_contest_archived(request),
             'forum_threads_per_page': getattr(settings, 'FORUM_THREADS_PER_PAGE', 30),
         },
     )
@@ -128,7 +145,7 @@ def thread_view(request, category_id, thread_id):
     category, thread = get_forum_ct(category_id, thread_id)
     forum = request.contest.forum
 
-    posts = thread.post_set.select_related('author').all()
+    posts = thread.post_set.select_related('author').order_by('add_date').all()
     posts = annotate_posts_with_current_user_reactions(request, posts)
 
     context = {
@@ -137,11 +154,13 @@ def thread_view(request, category_id, thread_id):
         'thread': thread,
         'msgs': get_msgs(request),
         'post_set': posts,
+        'forum_posts_per_page': getattr(settings, 'FORUM_POSTS_PER_PAGE', 30),
         'can_interact_with_users': can_interact_with_users(request),
         'can_interact_with_admins': can_interact_with_admins(request),
+        'message': get_new_post_message(request),
     }
 
-    if can_interact_with_users(request):
+    if can_interact_with_users(request) and not is_contest_archived(request):
         if request.method == "POST":
             form = PostForm(request, request.POST)
             if form.is_valid():
@@ -150,12 +169,16 @@ def thread_view(request, category_id, thread_id):
                 instance.thread = thread
                 instance.add_date = request.timestamp
                 instance.save()
-                return redirect(
+                post_count = thread.post_set.count()
+                page = (post_count - 1) // getattr(settings, 'FORUM_POSTS_PER_PAGE', 30) + 1
+                forum_thread_redirect = redirect(
                     'forum_thread',
                     contest_id=request.contest.id,
                     category_id=category.id,
                     thread_id=thread.id,
                 )
+                forum_thread_redirect['Location'] += f'?page={page}'
+                return forum_thread_redirect
         else:
             form = PostForm(request)
         context['form'] = form
@@ -163,7 +186,7 @@ def thread_view(request, category_id, thread_id):
     return TemplateResponse(request, 'forum/thread.html', context)
 
 
-@enforce_condition(not_anonymous & contest_exists & can_enter_contest)
+@enforce_condition(not_anonymous & contest_exists & can_enter_contest & ~is_contest_archived)
 @enforce_condition(forum_exists_and_visible & is_proper_forum & can_interact_with_users)
 def thread_add_view(request, category_id):
     category = get_object_or_404(Category, id=category_id)
@@ -210,6 +233,10 @@ def edit_post_view(request, category_id, thread_id, post_id):
     if not (post.author == request.user or is_admin):
         raise PermissionDenied
 
+    # Only admins can edit posts when contest is archived.
+    if not is_admin and is_contest_archived(request):
+        raise PermissionDenied
+
     if request.method == 'POST':
         form = PostForm(request, request.POST, instance=post)
         if form.is_valid():
@@ -252,6 +279,7 @@ def delete_post_view(request, category_id, thread_id, post_id):
             # you can remove a post only if there is no post added after yours
             and not thread.post_set.filter(add_date__gt=post.add_date).exists()
             and post.can_be_removed()
+            and not is_contest_archived(request)
         )
     ):
         raise PermissionDenied
@@ -373,7 +401,7 @@ def show_post_view(request, category_id, thread_id, post_id):
     )
 
 
-@enforce_condition(not_anonymous & contest_exists & can_enter_contest)
+@enforce_condition(not_anonymous & contest_exists & can_enter_contest & ~is_contest_archived)
 @enforce_condition(forum_exists_and_visible & is_proper_forum & can_interact_with_users)
 @require_POST
 def post_toggle_reaction(request, category_id, thread_id, post_id):
@@ -536,4 +564,38 @@ def ban_user_view(request, user_id):
             'next': redirect_url,
             'msgs': get_msgs(request),
         },
+    )
+
+
+@enforce_condition(contest_exists & is_contest_admin)
+def edit_message_view(request):
+    instance = get_forum_message(request)
+    if request.method == 'POST':
+        form = ForumMessageForm(request, request.POST, instance=instance)
+        if form.is_valid():
+            form.save()
+            return redirect('forum', contest_id=request.contest.id)
+    else:
+        form = ForumMessageForm(request, instance=instance)
+    return TemplateResponse(
+        request,
+        'public_message/edit.html',
+        {'form': form, 'title': _("Edit forum message")},
+    )
+
+
+@enforce_condition(contest_exists & is_contest_admin)
+def edit_new_post_message_view(request):
+    instance = get_new_post_message(request)
+    if request.method == 'POST':
+        form = NewPostMessageForm(request, request.POST, instance=instance)
+        if form.is_valid():
+            form.save()
+            return redirect('forum', contest_id=request.contest.id)
+    else:
+        form = NewPostMessageForm(request, instance=instance)
+    return TemplateResponse(
+        request,
+        'public_message/edit.html',
+        {'form': form, 'title': _("Edit new post message")},
     )

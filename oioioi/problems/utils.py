@@ -224,8 +224,12 @@ def generate_add_to_contest_metadata(request):
     "add to contest" functionality in problemset.
     """
 
-    administered = administered_contests(request)
-    # If user doesn't own any contest we won't show the option.
+    administered = [
+        contest
+        for contest in administered_contests(request)
+        if not contest.is_archived
+    ]
+    # If user doesn't own any unarchived contest we won't show the option.
     if administered:
         show_add_button = True
     else:
@@ -239,6 +243,7 @@ def generate_add_to_contest_metadata(request):
             contest
             for contest in rcontests
             if request.user.has_perm('contests.contest_admin', contest)
+            and not contest.is_archived
         ]
     return show_add_button, administered_recent_contests
 
@@ -296,7 +301,7 @@ def generate_model_solutions_context(request, problem_instance):
                     percentage_statuses[s.id] = '25'
                 elif time_ratio <= 0.50:
                     percentage_statuses[s.id] = '50'
-                    if submissions_percentage_statuses[s.id] is not '100':
+                    if submissions_percentage_statuses[s.id] != '100':
                         submissions_percentage_statuses[s.id] = '50'
                 else:
                     percentage_statuses[s.id] = '100'

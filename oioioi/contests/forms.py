@@ -9,9 +9,17 @@ from django.urls import reverse
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 
+from oioioi.base.forms import PublicMessageForm
 from oioioi.base.utils.inputs import narrow_input_field, narrow_input_fields
 from oioioi.base.utils.user_selection import UserSelectionField
-from oioioi.contests.models import Contest, ProblemInstance, Round
+from oioioi.contests.models import (
+    Contest,
+    ProblemInstance,
+    Round,
+    FilesMessage,
+    SubmissionsMessage,
+    SubmitMessage,
+)
 from oioioi.contests.utils import is_contest_basicadmin, submittable_problem_instances
 from oioioi.programs.models import Test
 
@@ -98,7 +106,7 @@ class ProblemInstanceForm(forms.ModelForm):
     def __init__(self, *args, **kwargs):
         instance = kwargs.get('instance')
         super(ProblemInstanceForm, self).__init__(*args, **kwargs)
-        if instance:
+        if instance and not instance.contest.is_archived:
             self.fields['round'].queryset = instance.contest.round_set
             self.fields['round'].required = True
 
@@ -364,3 +372,21 @@ class TestsSelectionForm(forms.Form):
         self.fields['submissions'] = forms.ModelMultipleChoiceField(
             widget=forms.CheckboxSelectMultiple, queryset=queryset, initial=queryset
         )
+
+
+class FilesMessageForm(PublicMessageForm):
+    class Meta(object):
+        model = FilesMessage
+        fields = ['content']
+
+
+class SubmissionsMessageForm(PublicMessageForm):
+    class Meta(object):
+        model = SubmissionsMessage
+        fields = ['content']
+
+
+class SubmitMessageForm(PublicMessageForm):
+    class Meta(object):
+        model = SubmitMessage
+        fields = ['content']
