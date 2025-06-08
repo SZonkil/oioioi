@@ -1,8 +1,11 @@
-version: '2.4'
-# https://github.com/docker/cli/issues/1293
+x-common-envs: &common-envs
+ FILETRACKER_URL: 'http://web:9999'
+ DATABASE_HOST: 'db'
+ DATABASE_PORT: '5432'
+
 services:
   db:
-    image: library/postgres:12.2
+    image: library/postgres:14.17
     environment:
       POSTGRES_USER: "oioioi"
       POSTGRES_PASSWORD: "password"
@@ -16,10 +19,20 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      target: development
       args:
         - "oioioi_uid=${OIOIOI_UID}"
       extra_hosts:
         - "web:127.0.0.1"
+    environment:
+      OIOIOI_DB_ENGINE: 'django.db.backends.postgresql'
+      RABBITMQ_HOST: 'broker'
+      RABBITMQ_PORT: '5672'
+      RABBITMQ_USER: 'oioioi'
+      RABBITMQ_PASSWORD: 'oioioi'
+      FILETRACKER_LISTEN_ADDR: '0.0.0.0'
+      FILETRACKER_LISTEN_PORT: '9999'
+      <<: *common-envs
     ports:
     # web server
       - "8000:8000"
@@ -27,6 +40,10 @@ services:
     # - "7887:7887"
     volumes:
       - .:/sio2/oioioi
+      # use docker's node_modules and dist_webpack instead of the host ones
+      - node_modules-dev:/sio2/oioioi/node_modules
+      - dist_webpack-dev:/sio2/oioioi/dist_webpack
+      - filetracker-data-dev:/sio2/deployment/media
 #      - ./deployment:/sio2/deployment
     stop_grace_period: 3m
     depends_on:
@@ -35,6 +52,9 @@ services:
   worker:
     image: sio2project/oioioi-dev
     command: ["/sio2/oioioi/worker_init.sh"]
+    environment:
+      WEB_URL: "web:8000"
+      <<: *common-envs
     volumes:
       - .:/sio2/oioioi
     stop_grace_period: 1m
@@ -50,3 +70,6 @@ services:
     stop_grace_period: 1m
 volumes:
   postgress-data-dev:
+  filetracker-data-dev:
+  node_modules-dev:
+  dist_webpack-dev:

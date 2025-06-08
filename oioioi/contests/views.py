@@ -12,6 +12,7 @@ from django.http import HttpResponse, HttpResponseRedirect
 from django.shortcuts import get_object_or_404, redirect
 from django.template.response import TemplateResponse
 from django.urls import reverse
+from django.utils.http import urlencode
 from django.utils.safestring import mark_safe
 from django.utils.translation import gettext_lazy as _
 from django.utils.translation import ngettext_lazy
@@ -29,11 +30,14 @@ from oioioi.contests.forms import (
     FilesMessageForm,
     SubmissionsMessageForm,
     SubmitMessageForm,
+    SubmissionMessageForm,
+    RoundSelectionForm,
 )
 from oioioi.contests.models import (
     Contest,
     ContestAttachment,
     ProblemInstance,
+    Round,
     Submission,
     SubmissionReport,
     UserResultForProblem,
@@ -51,11 +55,19 @@ from oioioi.contests.utils import (
     is_contest_basicadmin,
     is_contest_observer,
     visible_contests,
+    visible_contests_queryset, 
     visible_problem_instances,
     visible_rounds,
     get_files_message,
     get_submissions_message,
     get_submit_message,
+    get_number_of_rounds,
+    get_contest_dates,
+    get_problems_sumbmission_limit,
+    get_results_visibility,
+    are_rules_visible,
+    get_scoring_desription,
+    get_submission_message,
 )
 from oioioi.filetracker.utils import stream_file
 from oioioi.problems.models import ProblemAttachment, ProblemStatement
@@ -83,6 +95,7 @@ def select_contest_view(request):
     contests = sorted(contests, key=lambda x: x.creation_date, reverse=True)
     context = {
         'contests': contests,
+        'contests_on_page': getattr(settings, "CONTESTS_ON_PAGE", 20)
     }
     return TemplateResponse(
         request, 'contests/select_contest.html', context
@@ -100,6 +113,31 @@ def get_contest_permissions(request, response):
     response['is_contest_admin'] = is_contest_admin(request)
     response['is_contest_basicadmin'] = is_contest_basicadmin(request)
     return response
+
+
+@menu_registry.register_decorator(
+    _("Rules"), lambda request: reverse('contest_rules'), order=90
+)
+@enforce_condition(contest_exists & can_enter_contest & are_rules_visible)
+def contest_rules_view(request):
+    no_of_rounds = get_number_of_rounds(request)
+    scoring_description = get_scoring_desription(request)
+    results_visibility = get_results_visibility(request)
+    contest_dates = get_contest_dates(request)
+    submission_limit = get_problems_sumbmission_limit(request)
+
+    return TemplateResponse(
+        request,
+        'contests/contest_rules.html',
+        {
+            'no_of_rounds' : no_of_rounds,
+            'contest_start_date' : contest_dates[0],
+            'contest_end_date' : contest_dates[1],
+            'submission_limit' : submission_limit,
+            'results_visibility' : results_visibility,
+            'scoring_type' : scoring_description,
+        },
+    )
 
 
 @menu_registry.register_decorator(
@@ -350,6 +388,23 @@ def edit_submissions_message_view(request):
     )
 
 
+@enforce_condition(contest_exists & is_contest_basicadmin)
+def edit_submission_message_view(request):
+    instance = get_submission_message(request)
+    if request.method == 'POST':
+        form = SubmissionMessageForm(request, request.POST, instance=instance)
+        if form.is_valid():
+            form.save()
+            return redirect('my_submissions', contest_id=request.contest.id)
+    else:
+        form = SubmissionMessageForm(request, instance=instance)
+    return TemplateResponse(
+        request,
+        'public_message/edit.html',
+        {'form': form, 'title': _("Edit submission message")},
+    )
+
+
 @enforce_condition(not_anonymous)
 def all_submissions_view(request):
     submissions = []
@@ -508,7 +563,7 @@ def contest_files_view(request):
 
     round_file_exists = contest_files.filter(round__isnull=False).exists()
     add_category_field = round_file_exists or problem_files.exists()
-    rows = [
+    rows = sorted([
         {
             'category': cf.round if cf.round else '',
             'name': cf.download_name,
@@ -521,8 +576,9 @@ def contest_files_view(request):
             'admin_only': cf not in contest_files_without_admin,
         }
         for cf in contest_files
-    ]
-    rows += [
+    ], key=itemgetter('name'))
+
+    rows += sorted([
         {
             'category': pf.problem,
             'name': pf.download_name,
@@ -535,9 +591,8 @@ def contest_files_view(request):
             'admin_only': pf.problem_id not in problem_ids_without_admin,
         }
         for pf in problem_files
-    ]
-    rows += additional_files
-    rows.sort(key=itemgetter('name'))
+    ], key=itemgetter('name'))
+    rows += sorted(additional_files, key=itemgetter('name'))
     return TemplateResponse(
         request,
         'contests/files.html',
@@ -722,10 +777,81 @@ def reset_tests_limits_for_probleminstance_view(request, problem_instance_id):
         {'probleminstance': problem_instance},
     )
 
+def _get_problem_instances_from_problem_ids(problem_ids):
+    """
+    Retrieves a list of ProblemInstance objects corresponding to a comma-separated
+    list of problem IDs, performing validation on input.
+
+    Parameters:
+        problem_ids (str): A comma-separated string of problem IDs (e.g., "1,2,3").
+                           All IDs must be unique integers.
+
+    Returns:
+        List: A list of ProblemInstance objects with the given IDs.
+
+    Raises:
+        SuspiciousOperation: If the input is empty, contains non-digit values, duplicates,
+                             or references any non-existent problem ID.
+    """
+    if not problem_ids or not isinstance(problem_ids, str):
+        raise SuspiciousOperation("Invalid problem ids")
+
+    # Check if the problem ids are valid integers
+    if any(not i.isdigit() for i in problem_ids.split(',')):
+        raise SuspiciousOperation("Invalid problem ids")
+
+    # Convert the problem ids to integers
+    problem_ids = [int(i) for i in problem_ids.split(',')]
+
+    # Check if there are any duplicates in the problem ids
+    if len(problem_ids) != len(set(problem_ids)):
+        raise SuspiciousOperation("Duplicate problem ids")
+
+    # Get the problem instances
+    problem_instances = list(ProblemInstance.objects.filter(id__in=problem_ids))
+
+    # Check if all the requested problem instances exist in the database
+    if len(problem_instances) != len(problem_ids):
+        raise SuspiciousOperation("Invalid problem ids")
+
+    return problem_instances
+
+def _check_if_problem_instances_belong_to_contest(problem_instances, contest_id):
+    """
+    Check if all the given ProblemInstance objects belong to the specified contest.
+
+    Parameters:
+        problem_instances (list): A list of ProblemInstance objects.
+        contest (Contest): The Contest object to check against.
+
+    Returns:
+        bool: True if all ProblemInstance objects belong to the contest, False otherwise.
+    """
+    return all(pi.contest and pi.contest.id == contest_id for pi in problem_instances)
 
 @enforce_condition(contest_exists & is_contest_basicadmin)
-def reattach_problem_contest_list_view(request, problem_instance_id, full_list=False):
-    problem_instance = get_object_or_404(ProblemInstance, id=problem_instance_id)
+def reattach_problem_contest_list_view(request, full_list=False):
+    """
+    Handles the view for reattaching problem instances to a contest list.
+    This view retrieves problem instances based on the provided problem IDs
+    from the request, verifies their association with the current contest,
+    and renders a template displaying a list of contests where the user has
+    administrative privileges.
+    Args:
+        request (HttpRequest): The HTTP request object containing user and query parameters.
+        full_list (bool, optional): If True, retrieves all contests. If False, retrieves
+            only recent contests or all contests if no recent contests are available.
+            Defaults to False.
+    Raises:
+        SuspiciousOperation: If the provided problem instances do not belong to the current contest.
+    """
+
+    problem_ids = request.GET.get('ids')
+
+    problem_instances = _get_problem_instances_from_problem_ids(problem_ids)
+
+    if not _check_if_problem_instances_belong_to_contest(problem_instances, request.contest.id):
+        raise SuspiciousOperation("Invalid problem instances")
 
     if full_list:
         contests = Contest.objects.all()
@@ -737,27 +863,50 @@ def reattach_problem_contest_list_view(request, problem_instance_id, full_list=F
         request,
         'contests/reattach_problem_contest_list.html',
         {
-            'problem_instance': problem_instance,
+            'problem_instances': problem_instances,
             'contest_list': contests,
             'full_list': full_list,
+            'problem_ids': '%2C'.join(str(i) for i in problem_ids), # Separate the problem ids with a comma (%2C)
         },
     )
 
 
 @enforce_condition(contest_exists & is_contest_basicadmin)
-def reattach_problem_confirm_view(request, problem_instance_id, contest_id):
+def reattach_problem_confirm_view(request, contest_id):
+    """"
+    Reattach problems to a contest.
+    This view allows the user to reattach problems to a contest by copying
+    the problem instances from one contest to another. The user can choose
+    whether to copy the limits of the problem instances or create new ones.
+
+    Parameters:
+        request (HttpRequest): The HTTP request object.
+        contest_id (int): The ID of the contest to which the problems will be reattached.
+    Raises:
+        SuspiciousOperation: If the contest in the request is invalid, or if the problem
+                             instances do not belong to the source contest.
+    """
     contest = get_object_or_404(Contest, id=contest_id)
     if not can_admin_contest(request.user, contest):
         raise PermissionDenied
-    problem_instance = get_object_or_404(ProblemInstance, id=problem_instance_id)
+    
+    problem_ids = request.GET.get('ids')
+
+    # Get the problems instances from the request
+    problem_instances = _get_problem_instances_from_problem_ids(problem_ids)
+
+    if not _check_if_problem_instances_belong_to_contest(problem_instances, request.contest.id):
+        raise SuspiciousOperation("Invalid problem instances")
 
     if request.method == 'POST':
-        if request.POST.get('copy-limits', '') == 'on':
-            pi = copy_problem_instance(problem_instance, contest)
-        else:
-            pi = get_new_problem_instance(problem_instance.problem, contest)
-
-        messages.success(request, _(u"Problem {} added successfully.".format(pi)))
+        copied_instances = (
+            [copy_problem_instance(problem_instance, contest) 
+             for problem_instance in problem_instances]
+            if request.POST.get('copy-limits', '') == 'on'
+            else [get_new_problem_instance(problem_instance.problem, contest) 
+                  for problem_instance in problem_instances]
+        )
+        messages.success(request, _(u"Problems {} added successfully.".format(', '.join(map(str, copied_instances)))))
         return safe_redirect(
             request,
             reverse(
@@ -768,9 +917,81 @@ def reattach_problem_confirm_view(request, problem_instance_id, contest_id):
     return TemplateResponse(
         request,
         'contests/reattach_problem_confirm.html',
-        {'problem_instance': problem_instance, 'destination_contest': contest},
+        {
+            'problem_instances': problem_instances,
+            'contest': contest
+        },
     )
 
+@enforce_condition(contest_exists & is_contest_basicadmin)
+def assign_problems_to_a_round_view(request):
+    """
+    Handles the assignment of problem instances to a specific round within a contest.
+    This view retrieves problem instances based on the provided IDs in the request,
+    validates their association with the current contest, and allows the user to assign
+    them to a specific round within the contest. If the assignment is successful, the
+    user is redirected to the problem instance changelist page.
+    Args:
+        request (HttpRequest): The HTTP request object containing GET or POST data.
+    Raises:
+        SuspiciousOperation: If the contest in the request is invalid, or if the problem
+                             instances or selected round do not belong to the contest.
+    """
+
+    problem_ids = request.GET.get('ids')
+
+    # Get the problems instances from the request
+    problem_instances = _get_problem_instances_from_problem_ids(problem_ids)
+
+    if not request.contest:
+        raise SuspiciousOperation("Invalid contest")
+
+    if not _check_if_problem_instances_belong_to_contest(problem_instances, request.contest.id):
+        raise SuspiciousOperation("Invalid problem instances")
+
+    # Check if the contest has any rounds
+    if not request.contest.round_set.exists():
+        messages.error(request, _("The contest has no rounds."))
+        return redirect('oioioiadmin:contests_probleminstance_changelist')
+
+    # Check if the problem instances belong to the contest in the request
+    if not all(pi.contest and pi.contest.id == request.contest.id for pi in problem_instances):
+        raise SuspiciousOperation("Invalid problem instances")
+
+    if request.method == 'POST':
+        form = RoundSelectionForm(request.POST, contest=request.contest)
+        # Round is optional in the form, so we need to check if it is selected
+        if form.is_valid() and form.cleaned_data['round']:
+            round = form.cleaned_data['round']
+
+            # Next, we check if the round belongs to the same contest
+            if round.contest.id != request.contest.id:
+                raise SuspiciousOperation("Invalid round")
+            for problem_instance in problem_instances:
+                problem_instance.round = round
+                problem_instance.save()
+            messages.success(request, _("Problems assigned to the round {} successfully.".format(round.name)))
+            return safe_redirect(
+                request,
+                reverse(
+                    'oioioiadmin:contests_probleminstance_changelist',
+                    kwargs={'contest_id': request.contest.id},
+                ),
+            )
+        else:
+            # If the user didn't select a round, we need to show an error message
+            messages.error(request, _("Please select a round."))
+
+    form = RoundSelectionForm(contest=request.contest)
+
+    return TemplateResponse(
+        request,
+        'contests/assign_problems_to_a_round.html',
+        {
+            'problem_instances': problem_instances,
+            'form': form,
+        },
+    )
 
 @enforce_condition(contest_exists & is_contest_basicadmin)
 def confirm_archive_contest(request):
@@ -788,3 +1009,15 @@ def unarchive_contest(request):
     contest.is_archived = False
     contest.save()
     return redirect('default_contest_view', contest_id=contest.id)
+
+def filter_contests_view(request, filter_value=""):
+    contests = visible_contests_queryset(request, filter_value)
+    contests = sorted(contests, key=lambda x: x.creation_date, reverse=True)
+    
+    context = {
+        'contests' : contests,
+        'contests_on_page' : getattr(settings, 'CONTESTS_ON_PAGE', 20),
+    }  
+    return TemplateResponse(
+        request, 'contests/select_contest.html', context
+    )

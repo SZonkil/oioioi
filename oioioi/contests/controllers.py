@@ -6,7 +6,7 @@ from django.contrib import auth
 from django.core.exceptions import PermissionDenied
 from django.core.mail import EmailMessage
 from django.db import transaction
-from django.db.models import Q
+from django.db.models import Subquery
 from django.template.loader import render_to_string
 from django.urls import reverse
 from django.utils.safestring import mark_safe
@@ -154,15 +154,12 @@ class RegistrationController(RegisteredSubclassesBase, ObjectWithMixins):
             if not hasattr(backend, 'filter_for_perm'):
                 continue
             filt |= (
-                backend.filter_for_perm(Contest, 'contests.contest_admin', request.user)
+                backend.filter_for_perm(Contest, 'contests.contest_basicadmin', request.user)
                 | backend.filter_for_perm(
                     Contest, 'contests.contest_observer', request.user
                 )
                 | backend.filter_for_perm(
                     Contest, 'contests.personal_data', request.user
-                )
-                | backend.filter_for_perm(
-                    Contest, 'contests.contest_basicadmin', request.user
                 )
             )
         return filt
@@ -298,8 +295,7 @@ class PublicContestRegistrationController(RegistrationController):
 
     def filter_users_with_accessible_personal_data(self, queryset):
         submissions = Submission.objects.filter(problem_instance__contest=self.contest)
-        authors = [s.user for s in submissions]
-        return [q for q in queryset if q in authors]
+        return queryset.filter(id__in=Subquery(submissions.values('user_id')))
 
 
 class ContestControllerContext(object):
@@ -622,11 +618,11 @@ class ContestController(RegisteredSubclassesBase, ObjectWithMixins):
             return 'IGNORED'
         return 'NORMAL'
 
-    def get_submissions_limit(self, request, problem_instance, kind='NORMAL'):
-        if is_contest_basicadmin(request):
+    def get_submissions_limit(self, request, problem_instance, kind='NORMAL', noadmin=False):
+        if is_contest_basicadmin(request) and not noadmin:
             return None
         return problem_instance.problem.controller.get_submissions_limit(
-            request, problem_instance, kind
+            request, problem_instance, kind, noadmin
         )
 
     def get_submissions_left(self, request, problem_instance, kind=None):
